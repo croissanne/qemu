@@ -86,7 +86,7 @@ typedef struct {
     uint32_t num_gtes_per_gt;
     uint64_t rgd_offset;
     uint64_t gd_offset;
-    uint64_t grain_offset;
+    uint64_t grain_offset; // == overhead
     char filler[1];
     char check_bytes[4];
     uint16_t compressAlgorithm;
@@ -1349,6 +1349,7 @@ exit:
 static int vmdk_open(BlockDriverState *bs, QDict *options, int flags,
                      Error **errp)
 {
+    printf("vmdk open %s\n", bs->filename);
     char *buf;
     int ret;
     BDRVVmdkState *s = bs->opaque;
@@ -1429,6 +1430,7 @@ static void vmdk_refresh_limits(BlockDriverState *bs, Error **errp)
     BDRVVmdkState *s = bs->opaque;
     int i;
 
+    printf("VMDK_REFRESH_LIMITS\n");
     for (i = 0; i < s->num_extents; i++) {
         if (!s->extents[i].flat) {
             bs->bl.pwrite_zeroes_alignment =
@@ -1450,6 +1452,7 @@ static void vmdk_refresh_limits(BlockDriverState *bs, Error **errp)
  * [@skip_start_sector, @skip_end_sector) is not copied or written, and leave
  * it for call to write user data in the request.
  */
+/// XXX: this is problematic somewhere
 static int coroutine_fn GRAPH_RDLOCK
 get_whole_cluster(BlockDriverState *bs, VmdkExtent *extent,
                   uint64_t cluster_offset, uint64_t offset,
@@ -1492,6 +1495,7 @@ get_whole_cluster(BlockDriverState *bs, VmdkExtent *extent,
                 goto exit;
             }
         }
+        printf("skipstart bytes is bigger than 0, writing 0s\n");
         BLKDBG_CO_EVENT(extent->file, BLKDBG_COW_WRITE);
         ret = bdrv_co_pwrite(extent->file, cluster_offset, skip_start_bytes,
                              whole_grain, 0);
@@ -1513,6 +1517,7 @@ get_whole_cluster(BlockDriverState *bs, VmdkExtent *extent,
                 goto exit;
             }
         }
+        printf("skipend bytes is smaller than cluster bytes, writing 0s\n");
         BLKDBG_CO_EVENT(extent->file, BLKDBG_COW_WRITE);
         ret = bdrv_co_pwrite(extent->file, cluster_offset + skip_end_bytes,
                              cluster_bytes - skip_end_bytes,
@@ -1529,10 +1534,12 @@ exit:
     return ret;
 }
 
+/// XXX: this updates the grain directory
 static int coroutine_fn GRAPH_RDLOCK
 vmdk_L2update(VmdkExtent *extent, VmdkMetaData *m_data, uint32_t offset)
 {
     offset = cpu_to_le32(offset);
+    printf("UPDATING L2 TABLE wtf even is that: %ld\n", ((int64_t)m_data->l2_offset * 512) + (m_data->l2_index * sizeof(offset)));
     /* update L2 table */
     BLKDBG_CO_EVENT(extent->file, BLKDBG_L2_UPDATE);
     if (bdrv_co_pwrite(extent->file,
@@ -1838,6 +1845,7 @@ vmdk_write_extent(VmdkExtent *extent, int64_t cluster_offset,
     VmdkGrainMarker *data = NULL;
     uLongf buf_len;
     QEMUIOVector local_qiov;
+    bool is_zero;
     int64_t write_offset;
     int64_t write_end_sector;
 
@@ -1885,7 +1893,11 @@ vmdk_write_extent(VmdkExtent *extent, int64_t cluster_offset,
         BLKDBG_CO_EVENT(extent->file, BLKDBG_WRITE_AIO);
     }
 
+    /* bool qemu_iovec_is_zero(QEMUIOVector *qiov, size_t qiov_offeset, size_t bytes); */
+    is_zero = qemu_iovec_is_zero(&local_qiov, 0, data->size);
+
     write_offset = cluster_offset + offset_in_cluster;
+    printf("data: writing grain marker with size %d; n_bytes: %ld; is zero?! %b; write offset: %ld\n", data->size, n_bytes, is_zero, write_offset);
     ret = bdrv_co_pwritev(extent->file, write_offset, n_bytes,
                           &local_qiov, 0);
 
@@ -1980,6 +1992,7 @@ static int coroutine_fn GRAPH_RDLOCK
 vmdk_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
                QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
+    printf("vmdk_co_preadv %s\n", bs->filename);
     BDRVVmdkState *s = bs->opaque;
     int ret;
     uint64_t n_bytes, offset_in_cluster;
@@ -2062,6 +2075,7 @@ static int coroutine_fn GRAPH_RDLOCK
 vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
              QEMUIOVector *qiov, bool zeroed, bool zero_dry_run)
 {
+    printf("\n\nvmdk_pwritev: %ld bytes\n", bytes);
     BDRVVmdkState *s = bs->opaque;
     VmdkExtent *extent = NULL;
     int ret;
@@ -2078,6 +2092,7 @@ vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
     }
 
     while (bytes > 0) {
+        printf("ONE MORE TIME (bytes %ld)\n", bytes);
         extent = find_extent(s, offset >> BDRV_SECTOR_BITS, extent);
         if (!extent) {
             return -EIO;
@@ -2089,6 +2104,7 @@ vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
         n_bytes = MIN(bytes, extent->cluster_sectors * BDRV_SECTOR_SIZE
                              - offset_in_cluster);
 
+        ///XXX: this writes zeros at the end too
         ret = get_cluster_offset(bs, extent, &m_data, offset,
                                  !(extent->compressed || zeroed),
                                  &cluster_offset, offset_in_cluster,
@@ -2109,6 +2125,7 @@ vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
             return -EINVAL;
         }
         if (zeroed) {
+            printf("vmdk going to do a zeroed write: %ld %ld %ld\n", bytes_done, n_bytes, offset);
             /* Do zeroed write, buf is ignored */
             if (extent->has_zero_grain &&
                     offset_in_cluster == 0 &&
@@ -2125,6 +2142,7 @@ vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
                 return -ENOTSUP;
             }
         } else {
+            printf("vmdk going to write extent: %ld %ld %ld\n", bytes_done, n_bytes, offset);
             ret = vmdk_write_extent(extent, cluster_offset, offset_in_cluster,
                                     qiov, bytes_done, n_bytes, offset);
             if (ret) {
@@ -2152,6 +2170,7 @@ vmdk_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
             }
             s->cid_updated = true;
         }
+        printf("done with one write\n");
     }
     return 0;
 }
@@ -2160,6 +2179,7 @@ static int coroutine_fn GRAPH_RDLOCK
 vmdk_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
                 QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
+    printf("vmdk_co_pwritev %s\n", bs->filename);
     int ret;
     BDRVVmdkState *s = bs->opaque;
     qemu_co_mutex_lock(&s->lock);
@@ -2172,6 +2192,7 @@ static int coroutine_fn GRAPH_RDLOCK
 vmdk_co_pwritev_compressed(BlockDriverState *bs, int64_t offset, int64_t bytes,
                            QEMUIOVector *qiov)
 {
+    printf("vmdk_co_pwritev_compressed %s\n", bs->filename);
     if (bytes == 0) {
         /* The caller will write bytes 0 to signal EOF.
          * When receive it, we align EOF to a sector boundary. */
@@ -2200,6 +2221,7 @@ static int coroutine_fn GRAPH_RDLOCK
 vmdk_co_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
                       BdrvRequestFlags flags)
 {
+    printf("vmdk_co_pwritev_zeroes %s\n", bs->filename);
     int ret;
     BDRVVmdkState *s = bs->opaque;
 
@@ -2216,7 +2238,7 @@ vmdk_co_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
 
 static int coroutine_fn GRAPH_UNLOCKED
 vmdk_init_extent(BlockBackend *blk, int64_t filesize, bool flat, bool compress,
-                 bool zeroed_grain, Error **errp)
+                 bool zeroed_grain, bool stream_optimized, Error **errp)
 {
     int ret, i;
     VMDK4Header header;
@@ -2237,24 +2259,41 @@ vmdk_init_extent(BlockBackend *blk, int64_t filesize, bool flat, bool compress,
     } else {
         header.version = 1;
     }
-    header.flags = VMDK4_FLAG_RGD | VMDK4_FLAG_NL_DETECT
+
+    // XXX: if streamoptimised don't set RGD => no rgd for SO disks
+    header.flags =  VMDK4_FLAG_NL_DETECT
                    | (compress ? VMDK4_FLAG_COMPRESS | VMDK4_FLAG_MARKER : 0)
-                   | (zeroed_grain ? VMDK4_FLAG_ZERO_GRAIN : 0);
+                   | (zeroed_grain ? VMDK4_FLAG_ZERO_GRAIN : 0)
+                   | (stream_optimized ? 0 : VMDK4_FLAG_RGD);
     header.compressAlgorithm = compress ? VMDK4_COMPRESSION_DEFLATE : 0;
     header.capacity = filesize / BDRV_SECTOR_SIZE;
     header.granularity = 128;
     header.num_gtes_per_gt = BDRV_SECTOR_SIZE;
 
-    grains = DIV_ROUND_UP(filesize / BDRV_SECTOR_SIZE, header.granularity);
+    // XXX: filesize / 512 / 128 === filesize / 65536 == filsize / (128 * 512)
+    grains = DIV_ROUND_UP(filesize / BDRV_SECTOR_SIZE, header.granularity); // 1M = 16 *64kB
+    // XXX: each grain table is always 2 kb -> 4 sectors
     gt_size = DIV_ROUND_UP(header.num_gtes_per_gt * sizeof(uint32_t),
-                           BDRV_SECTOR_SIZE);
+                           BDRV_SECTOR_SIZE); // === 4 == sectors 512 entries * 4 /512
+
     gt_count = DIV_ROUND_UP(grains, header.num_gtes_per_gt);
     gd_sectors = DIV_ROUND_UP(gt_count * sizeof(uint32_t), BDRV_SECTOR_SIZE);
+    printf("filesize: %ld, GRAINS: %d, GT_SIZE: %d, GT_COUNT: %d, GD_SECTORS: %d\n", filesize, grains, gt_size, gt_count, gd_sectors);
 
     header.desc_offset = 1;
     header.desc_size = 20;
-    header.rgd_offset = header.desc_offset + header.desc_size;
-    header.gd_offset = header.rgd_offset + gd_sectors + (gt_size * gt_count);
+
+    // XXX: streamoptimized disks do not have RDGs
+    if (stream_optimized) {
+      header.rgd_offset = 0;
+      header.gd_offset = header.desc_offset + header.desc_size;
+
+    } else {
+      header.rgd_offset = header.desc_offset + header.desc_size;
+      header.gd_offset = header.rgd_offset + gd_sectors + (gt_size * gt_count);
+    }
+
+    // XXX: this is lower than using vmware-vdiskmanager
     header.grain_offset =
         ROUND_UP(header.gd_offset + gd_sectors + (gt_size * gt_count),
                  header.granularity);
@@ -2294,21 +2333,26 @@ vmdk_init_extent(BlockBackend *blk, int64_t filesize, bool flat, bool compress,
         goto exit;
     }
 
-    /* write grain directory */
+    /* write backup grain directory */
+    /* gd_buf_size = grains * sizeof(uint32_t); // gd_sectors * BDRV_SECTOR_SIZE; */
     gd_buf_size = gd_sectors * BDRV_SECTOR_SIZE;
     gd_buf = g_malloc0(gd_buf_size);
-    for (i = 0, tmp = le64_to_cpu(header.rgd_offset) + gd_sectors;
-         i < gt_count; i++, tmp += gt_size) {
+
+    if (!stream_optimized) {
+      for (i = 0, tmp = le64_to_cpu(header.rgd_offset) + gd_sectors;
+           i < gt_count; i++, tmp += gt_size) {
         gd_buf[i] = cpu_to_le32(tmp);
-    }
-    ret = blk_co_pwrite(blk, le64_to_cpu(header.rgd_offset) * BDRV_SECTOR_SIZE,
-                        gd_buf_size, gd_buf, 0);
-    if (ret < 0) {
+      }
+      ret = blk_co_pwrite(blk, le64_to_cpu(header.rgd_offset) * BDRV_SECTOR_SIZE,
+                          gd_buf_size, gd_buf, 0);
+      if (ret < 0) {
         error_setg_errno(errp, -ret, "failed to write VMDK grain directory");
         goto exit;
+      }
     }
 
-    /* write backup grain directory */
+    /* printf(" */
+    /* write grain directory */
     for (i = 0, tmp = le64_to_cpu(header.gd_offset) + gd_sectors;
          i < gt_count; i++, tmp += gt_size) {
         gd_buf[i] = cpu_to_le32(tmp);
@@ -2317,9 +2361,25 @@ vmdk_init_extent(BlockBackend *blk, int64_t filesize, bool flat, bool compress,
                         gd_buf_size, gd_buf, 0);
     if (ret < 0) {
         error_setg_errno(errp, -ret,
-                         "failed to write VMDK backup grain directory");
+                         "failed to write VMDK grain directory");
     }
 
+    // XXX: MISSING EOS marker! is it simply 512 bytes at the end that's missing from the origina image?!
+
+    /* // if streamoptimised, add EOS_MARKER */
+    /* printf("OFFSET %lld ;;;; %d\n", le64_to_cpu(header.gd_offset) * BDRV_SECTOR_SIZE, gd_buf_size); */
+    /* VmdkGrainMarker *data = NULL; */
+    /* data = g_malloc(sizeof(VmdkGrainMarker) + 500); */
+    /* data->lba = 0; */
+    /* data->size = 0; */
+    /* memset(data->data, 0, 500); */
+    /* ret = blk_co_pwrite(blk, le64_to_cpu(header.gd_offset) * BDRV_SECTOR_SIZE + gd_buf_size, 512, data, 0); */
+    /* if (ret < 0) { */
+    /*     error_setg_errno(errp, -ret, "Could not write description"); */
+    /*     g_free(data); */
+    /*     goto exit; */
+    /* } */
+    /* g_free(data); */
     ret = 0;
 exit:
     g_free(gd_buf);
@@ -2328,8 +2388,8 @@ exit:
 
 static int coroutine_fn GRAPH_UNLOCKED
 vmdk_create_extent(const char *filename, int64_t filesize, bool flat,
-                   bool compress, bool zeroed_grain, BlockBackend **pbb,
-                   QemuOpts *opts, Error **errp)
+                   bool compress, bool zeroed_grain, bool stream_optimized,
+                   BlockBackend **pbb, QemuOpts *opts, Error **errp)
 {
     int ret;
     BlockBackend *blk = NULL;
@@ -2349,7 +2409,7 @@ vmdk_create_extent(const char *filename, int64_t filesize, bool flat,
 
     blk_set_allow_write_beyond_eof(blk, true);
 
-    ret = vmdk_init_extent(blk, filesize, flat, compress, zeroed_grain, errp);
+    ret = vmdk_init_extent(blk, filesize, flat, compress, zeroed_grain, stream_optimized, errp);
 exit:
     if (blk) {
         if (pbb) {
@@ -2409,7 +2469,7 @@ static int filename_decompose(const char *filename, char *path, char *prefix,
  */
 typedef BlockBackend * coroutine_fn GRAPH_UNLOCKED_PTR
     (*vmdk_create_extent_fn)(int64_t size, int idx, bool flat, bool split,
-                             bool compress, bool zeroed_grain, void *opaque,
+                             bool compress, bool zeroed_grain, bool stream_optimized, void *opaque,
                              Error **errp);
 
 static void vmdk_desc_add_extent(GString *desc,
@@ -2436,6 +2496,8 @@ vmdk_co_do_create(int64_t size,
                   void *opaque,
                   Error **errp)
 {
+
+    printf("DO CREATE\n");
     int extent_idx;
     BlockBackend *blk = NULL;
     BlockBackend *extent_blk;
@@ -2531,7 +2593,7 @@ vmdk_co_do_create(int64_t size,
         created_size = 0;
     }
     /* Get the descriptor file BDS */
-    blk = extent_fn(created_size, 0, flat, split, compress, zeroed_grain,
+    blk = extent_fn(created_size, 0, flat, split, compress, zeroed_grain, subformat == BLOCKDEV_VMDK_SUBFORMAT_STREAMOPTIMIZED,
                     opaque, errp);
     if (!blk) {
         ret = -EIO;
@@ -2583,9 +2645,10 @@ vmdk_co_do_create(int64_t size,
     }
     extent_idx = 1;
     while (created_size < size) {
+        printf("CREATED SIZE %ld vs SIZE %ld\n", created_size, size);
         int64_t cur_size = MIN(size - created_size, extent_size);
         extent_blk = extent_fn(cur_size, extent_idx, flat, split, compress,
-                               zeroed_grain, opaque, errp);
+                               zeroed_grain, subformat == BLOCKDEV_VMDK_SUBFORMAT_STREAMOPTIMIZED, opaque, errp);
         if (!extent_blk) {
             ret = -EINVAL;
             goto exit;
@@ -2595,11 +2658,11 @@ vmdk_co_do_create(int64_t size,
         created_size += cur_size;
         extent_idx++;
         blk_co_unref(extent_blk);
+        printf("created size %ld, size %ld\n", created_size, size);
     }
 
     /* Check whether we got excess extents */
-    extent_blk = extent_fn(-1, extent_idx, flat, split, compress, zeroed_grain,
-                           opaque, NULL);
+    extent_blk = extent_fn(-1, extent_idx, flat, split, compress, zeroed_grain, subformat == BLOCKDEV_VMDK_SUBFORMAT_STREAMOPTIMIZED, opaque, NULL);
     if (extent_blk) {
         blk_co_unref(extent_blk);
         error_setg(errp, "List of extents contains unused extents");
@@ -2626,6 +2689,8 @@ vmdk_co_do_create(int64_t size,
         desc_offset = 0x200;
     }
 
+
+    printf("writing desc\n");
     ret = blk_co_pwrite(blk, desc_offset, desc_len, desc, 0);
     if (ret < 0) {
         error_setg_errno(errp, -ret, "Could not write description");
@@ -2634,11 +2699,13 @@ vmdk_co_do_create(int64_t size,
     /* bdrv_pwrite write padding zeros to align to sector, we don't need that
      * for description file */
     if (desc_offset == 0) {
-        ret = blk_co_truncate(blk, desc_len, false, PREALLOC_MODE_OFF, 0, errp);
+          printf("writing desc\n");
+          ret = blk_co_truncate(blk, desc_len, false, PREALLOC_MODE_OFF, 0, errp);
         if (ret < 0) {
             goto exit;
         }
     }
+
     ret = 0;
 exit:
     if (blk) {
@@ -2659,7 +2726,7 @@ typedef struct {
 
 static BlockBackend * coroutine_fn GRAPH_UNLOCKED
 vmdk_co_create_opts_cb(int64_t size, int idx, bool flat, bool split,
-                       bool compress, bool zeroed_grain, void *opaque,
+                       bool compress, bool zeroed_grain, bool stream_optimized, void *opaque,
                        Error **errp)
 {
     BlockBackend *blk = NULL;
@@ -2689,7 +2756,7 @@ vmdk_co_create_opts_cb(int64_t size, int idx, bool flat, bool split,
     g_free(rel_filename);
 
     if (vmdk_create_extent(ext_filename, size,
-                           flat, compress, zeroed_grain, &blk, data->opts,
+                           flat, compress, zeroed_grain, stream_optimized, &blk, data->opts,
                            errp)) {
         goto exit;
     }
@@ -2810,7 +2877,7 @@ exit:
 
 static BlockBackend * coroutine_fn GRAPH_UNLOCKED
 vmdk_co_create_cb(int64_t size, int idx, bool flat, bool split, bool compress,
-                  bool zeroed_grain, void *opaque, Error **errp)
+                  bool zeroed_grain, bool stream_optimized, void *opaque, Error **errp)
 {
     int ret;
     BlockDriverState *bs;
@@ -2850,7 +2917,7 @@ vmdk_co_create_cb(int64_t size, int idx, bool flat, bool split, bool compress,
     bdrv_co_unref(bs);
 
     if (size != -1) {
-        ret = vmdk_init_extent(blk, size, flat, compress, zeroed_grain, errp);
+      ret = vmdk_init_extent(blk, size, flat, compress, zeroed_grain, stream_optimized, errp);
         if (ret) {
             blk_co_unref(blk);
             blk = NULL;
@@ -2862,6 +2929,7 @@ vmdk_co_create_cb(int64_t size, int idx, bool flat, bool split, bool compress,
 static int coroutine_fn GRAPH_UNLOCKED
 vmdk_co_create(BlockdevCreateOptions *create_options, Error **errp)
 {
+    printf("vmdk_co_create\n");
     BlockdevCreateOptionsVmdk *opts;
 
     opts = &create_options->u.vmdk;
@@ -2886,6 +2954,7 @@ vmdk_co_create(BlockdevCreateOptions *create_options, Error **errp)
 
 static void vmdk_close(BlockDriverState *bs)
 {
+    printf("vmdk_close\n");
     BDRVVmdkState *s = bs->opaque;
 
     vmdk_free_extents(bs);
@@ -2916,6 +2985,7 @@ vmdk_co_get_allocated_file_size(BlockDriverState *bs)
         }
         ret += r;
     }
+    printf("vmdk_co_get_allocated_file_size: %ld\n", ret);
     return ret;
 }
 

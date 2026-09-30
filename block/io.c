@@ -1129,6 +1129,7 @@ bdrv_driver_pwritev_compressed(BlockDriverState *bs, int64_t offset,
                                int64_t bytes, QEMUIOVector *qiov,
                                size_t qiov_offset)
 {
+    printf("bdrv_driver_pwritev_compressed: %ld %ld\n", offset, bytes);
     BlockDriver *drv = bs->drv;
     QEMUIOVector local_qiov;
     int ret;
@@ -2025,12 +2026,14 @@ bdrv_co_write_req_prepare(BdrvChild *child, int64_t offset, int64_t bytes,
     }
 }
 
+/// XXX: i think this is the kicker? somehow it resizes the parent or somthing i have no idea
 static inline void coroutine_fn GRAPH_RDLOCK
 bdrv_co_write_req_finish(BdrvChild *child, int64_t offset, int64_t bytes,
                          BdrvTrackedRequest *req, int ret)
 {
     int64_t end_sector = DIV_ROUND_UP(offset + bytes, BDRV_SECTOR_SIZE);
     BlockDriverState *bs = child->bs;
+    printf("bdrv_co_write_req_finish: %ld (offset) %ld (bytes) %ld (end_sector) %ld\n", offset, bytes, end_sector, bs->total_sectors);
 
     bdrv_check_request(offset, bytes, &error_abort);
 
@@ -2047,17 +2050,19 @@ bdrv_co_write_req_finish(BdrvChild *child, int64_t offset, int64_t bytes,
         (req->type == BDRV_TRACKED_TRUNCATE ||
          end_sector > bs->total_sectors) &&
         req->type != BDRV_TRACKED_DISCARD) {
+        // XXX: something here appends a new 64k chunk after each write
         bs->total_sectors = end_sector;
         bdrv_co_parent_cb_resize(bs);
         bdrv_dirty_bitmap_truncate(bs, end_sector << BDRV_SECTOR_BITS);
     }
     if (req->bytes) {
+        printf("req finish has bytes: %ld\n", req->bytes);
         switch (req->type) {
         case BDRV_TRACKED_WRITE:
             {
                 uint64_t new = offset + bytes;
                 uint64_t old = qatomic_read(&bs->wr_highest_offset);
-
+                printf("tracked write: %ld (old) %ld (new)\n", old, new);
                 while (old < new) {
                     old = qatomic_cmpxchg(&bs->wr_highest_offset, old, new);
                 }
@@ -2082,6 +2087,7 @@ bdrv_aligned_pwritev(BdrvChild *child, BdrvTrackedRequest *req,
                      QEMUIOVector *qiov, size_t qiov_offset,
                      BdrvRequestFlags flags)
 {
+    printf("bdrv_aligned_pwritev: %ld %ld %ld (offset, bytes, align)\n", offset, bytes, align);
     BlockDriverState *bs = child->bs;
     BlockDriver *drv = bs->drv;
     int ret;
@@ -2159,6 +2165,7 @@ bdrv_aligned_pwritev(BdrvChild *child, BdrvTrackedRequest *req,
     if (ret >= 0) {
         ret = 0;
     }
+    printf("AAAAA\n");
     bdrv_co_write_req_finish(child, offset, bytes, req, ret);
 
     return ret;
@@ -2168,6 +2175,7 @@ static int coroutine_fn GRAPH_RDLOCK
 bdrv_co_do_zero_pwritev(BdrvChild *child, int64_t offset, int64_t bytes,
                         BdrvRequestFlags flags, BdrvTrackedRequest *req)
 {
+    printf("bdrv_co_do_zero_pwritev\n");
     BlockDriverState *bs = child->bs;
     QEMUIOVector local_qiov;
     uint64_t align = bs->bl.request_alignment;
@@ -2246,6 +2254,7 @@ int coroutine_fn bdrv_co_pwritev_part(BdrvChild *child,
     int64_t offset, int64_t bytes, QEMUIOVector *qiov, size_t qiov_offset,
     BdrvRequestFlags flags)
 {
+    printf("bdrv_co_pwritev_part %ld (offset) %ld (bytes)\n", offset, bytes);
     BlockDriverState *bs = child->bs;
     BdrvTrackedRequest req;
     uint64_t align = bs->bl.request_alignment;
@@ -3155,6 +3164,7 @@ early_exit:
 int coroutine_fn bdrv_co_pdiscard(BdrvChild *child, int64_t offset,
                                   int64_t bytes)
 {
+    printf("bdrv_co_pdiscard\n");
     BdrvTrackedRequest req;
     int ret;
     int64_t max_pdiscard;
@@ -3256,6 +3266,7 @@ int coroutine_fn bdrv_co_pdiscard(BdrvChild *child, int64_t offset,
     }
     ret = 0;
 out:
+    printf("BBBB\n");
     bdrv_co_write_req_finish(child, req.offset, req.bytes, &req, ret);
     tracked_request_end(&req);
     bdrv_dec_in_flight(bs);
@@ -3465,6 +3476,7 @@ static int coroutine_fn GRAPH_RDLOCK bdrv_co_copy_range_internal(
         BdrvRequestFlags read_flags, BdrvRequestFlags write_flags,
         bool recurse_src)
 {
+    printf("bdrv_co_copy_range_internal\n");
     BdrvTrackedRequest req;
     int ret;
     assert_bdrv_graph_readable();
@@ -3530,6 +3542,7 @@ static int coroutine_fn GRAPH_RDLOCK bdrv_co_copy_range_internal(
                                                       bytes,
                                                       read_flags, write_flags);
         }
+        printf("CCCC\n");
         bdrv_co_write_req_finish(dst, dst_offset, bytes, &req, ret);
         tracked_request_end(&req);
         bdrv_dec_in_flight(dst->bs);
@@ -3612,6 +3625,7 @@ int coroutine_fn bdrv_co_truncate(BdrvChild *child, int64_t offset, bool exact,
                                   PreallocMode prealloc, BdrvRequestFlags flags,
                                   Error **errp)
 {
+    printf("bdrv_co_truncate\n");
     BlockDriverState *bs = child->bs;
     BdrvChild *filtered, *backing;
     BlockDriver *drv = bs->drv;
@@ -3728,6 +3742,7 @@ int coroutine_fn bdrv_co_truncate(BdrvChild *child, int64_t offset, bool exact,
      * failed, but the latter doesn't affect how we should finish the request.
      * Pass 0 as the last parameter so that dirty bitmaps etc. are handled.
      */
+    printf("dDDDD\n");
     bdrv_co_write_req_finish(child, offset - new_bytes, new_bytes, &req, 0);
 
 out:
